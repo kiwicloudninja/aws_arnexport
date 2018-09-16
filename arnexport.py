@@ -22,6 +22,7 @@
 from os import sys
 import json
 import boto3
+import botocore
 import yaml
 
 class ARNExport():
@@ -33,6 +34,7 @@ class ARNExport():
         self.arn_str = arn_str
         self.arn_map = self.get_arn_map(arn_str)
         self.cf_resources = {}
+        self.raw = {}
 
     @classmethod
     def get_cloudform_spec(cls):
@@ -162,6 +164,11 @@ class ARNExport():
         arn_map = self.get_arn_map(arn_str) if arn_str != '' else self.arn_map
         aws = self.get_aws_client(arn_map)
 
+        if 'resourcetype' not in arn_map:
+            sys.exit(
+                "I don't have a way of exporting this resource: {}{}".format(arn_str, self.arn_str)
+            )
+
         func = self.get_resource_function(aws, 'get_{}'.format(arn_map['resourcetype']))
         if func is None:
             func = getattr(aws, 'describe_{}s'.format(arn_map['resourcetype']))
@@ -173,8 +180,14 @@ class ARNExport():
         arg_key = self.get_resource_name(arn_map)
         args = {arg_name: arg_key}
 
-        resource = func(**args)
+        try:
+            resource = func(**args)
+        except botocore.exceptions.ParamValidationError:
+            sys.exit("I don't have a way of retrieving this resource for export.")
+
         resource.pop('ResponseMetadata', None)
+
+        self.raw.update(resource)
 
         return resource
 
@@ -198,6 +211,15 @@ class ARNExport():
         }
 
         with open("templates/{}.yml".format(descr), 'w') as yaml_file:
+            yaml.dump(template, yaml_file, default_flow_style=False)
+
+        template = {
+            'AWSTemplateFormatVersion': '2010-09-09',
+            'Description': 'Exported {} from {}'.format(descr, self.arn_str),
+            'Resources': self.raw
+        }
+
+        with open("templates/{}_raw.yml".format(descr), 'w') as yaml_file:
             yaml.dump(template, yaml_file, default_flow_style=False)
 
 if __name__ == "__main__":
