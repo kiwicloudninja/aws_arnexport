@@ -85,13 +85,16 @@ class ARNExport():
         return None
 
 
-    def get_resource_name(self, arn_map):
+    def get_resource_name(self, arn_map, cleaned=True):
         '''Extracts a readable name from the ARN map'''
         name = arn_map['resource']
         if 'qualifier' in arn_map and self.func_type == 0:
             name = arn_map['qualifier']
 
-        return name.replace('-', '')
+        if cleaned:
+            return name.replace('-', '')
+
+        return name
 
 
     def format_resource(self, resource, arn_str=''):
@@ -173,7 +176,7 @@ class ARNExport():
             args = service_args[arn_map['service']]
         else:
             arg_name = '{}Name'.format(arn_map['resourcetype'].title())
-            arg_value = self.get_resource_name(arn_map)
+            arg_value = self.get_resource_name(arn_map, False)
             args = {arg_name: arg_value}
 
         return args
