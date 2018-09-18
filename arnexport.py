@@ -46,9 +46,15 @@ class ARNExport():
 
 
     def get_dict_value(self, search_key, search_dict):
-        '''crawls through dict to find key in dict'''
+        '''crawls through dict to find key value in dict'''
         found_value = None
         for key, value in search_dict.items():
+            if isinstance(value, list):
+                if not value:
+                    continue
+                found_value = self.get_dict_value(search_key, value[0])
+                if found_value is not None:
+                    break
             found_value = value if key == search_key else None
             if found_value is None and isinstance(value, dict):
                 found_value = self.get_dict_value(search_key, value)
@@ -107,12 +113,12 @@ class ARNExport():
         for key in resource_type['Properties'].keys():
             value = self.get_dict_value(key, resource)
             if value is None:
+                if resource_type['Properties'][key]['Required']:
+                    cf_resource[resource_name]['Properties'][key] = ''
                 continue
-
             if isinstance(value, str) and value.find('arn:aws') >= 0:
                 cf_resource[resource_name]['Properties'][key] = self.expand_arn(value)
                 continue
-
             cf_resource[resource_name]['Properties'][key] = value
 
         return {'name': resource_name, 'resource': cf_resource}
@@ -158,6 +164,19 @@ class ARNExport():
             func = None
         return func
 
+    def get_function_args(self, arn_map):
+        '''returns boto3 function arguments based on the resource type'''
+        service_args = {
+            'ec2': {'InstanceIds': [arn_map['resource']]}
+        }
+        if arn_map['service'] in service_args:
+            args = service_args[arn_map['service']]
+        else:
+            arg_name = '{}Name'.format(arn_map['resourcetype'].title())
+            arg_value = self.get_resource_name(arn_map)
+            args = {arg_name: arg_value}
+
+        return args
 
     def get_resource_from_arn(self, arn_str=''):
         '''returns a dict boto3 client resource from an arn_str'''
@@ -176,9 +195,7 @@ class ARNExport():
             if func is None:
                 sys.exit("I don't have a way of exporting this resource")
 
-        arg_name = '{}Name'.format(arn_map['resourcetype'].title())
-        arg_key = self.get_resource_name(arn_map)
-        args = {arg_name: arg_key}
+        args = self.get_function_args(arn_map)
 
         try:
             resource = func(**args)
