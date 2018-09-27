@@ -35,6 +35,7 @@ class ARNExport():
         self.arn_map = self.get_arn_map(arn_str)
         self.cf_resources = {}
         self.raw = {}
+        self.cloudform_spec = self.get_cloudform_spec()
 
     @classmethod
     def get_cloudform_spec(cls):
@@ -66,20 +67,24 @@ class ARNExport():
 
     def expand_arn(self, arn_str):
         '''Returns a CloudFormation !Ref string to a nested ARN resource'''
-        print('Extracting {}'.format(arn_str))
+        print('Expanding {}'.format(arn_str))
         cf_resource = self.format_resource(self.get_resource_from_arn(arn_str), arn_str)
-        self.cf_resources.update(cf_resource['resource'])
+        if cf_resource is None:
+            return arn_str
 
+        self.cf_resources.update(cf_resource['resource'])
         return "!Ref {}".format(cf_resource['name'])
 
 
     def get_resource_type(self, arn_map):
         '''returns a CloudFormation resource type from incorrectly cased boto3 resource type'''
-        api_type = "AWS::{}::{}".format(arn_map['service'], arn_map['resourcetype'])
-        cloudform_spec = self.get_cloudform_spec()
-        for key in cloudform_spec['ResourceTypes'].keys():
+        api_type = "AWS::{}::{}".format(
+            arn_map['service'],
+            arn_map['resourcetype'].replace('-', '')
+            )
+        for key in self.cloudform_spec['ResourceTypes'].keys():
             if key.lower() == api_type.lower():
-                resource_properties = cloudform_spec['ResourceTypes'][key]['Properties']
+                resource_properties = self.cloudform_spec['ResourceTypes'][key]['Properties']
                 return {'Type':key, 'Properties': resource_properties}
 
         return None
@@ -96,33 +101,112 @@ class ARNExport():
 
         return name
 
+    def validate_resource_value(self, spec_type, value, resource_name):
+        '''Validates boto3 resource properties against CloudFormation specifications'''
+        cf_value = {}
+        print("Validating {} {}".format(resource_name, spec_type))
+        if spec_type not in self.cloudform_spec['PropertyTypes']:
+            print("Skipping {} validation".format(spec_type))
+            return value
+
+        for prop_key in self.cloudform_spec['PropertyTypes'][spec_type]['Properties'].keys():
+            prop_value = self.get_dict_value(prop_key, value)
+            if prop_value is None:
+#                cf_value[prop_key] = '!Ref {}{}'.format(resource_name.title(), prop_key.title())
+                continue
+
+            if isinstance(prop_value, str) and prop_value.find('arn:aws') >= 0:
+                cf_value[prop_key] = self.expand_arn(prop_value)
+                continue
+
+
+            sub_props = self.cloudform_spec['PropertyTypes'][spec_type]['Properties'][prop_key]
+            if 'Type' not in sub_props:
+                cf_value[prop_key] = prop_value
+                continue
+
+            sub_type = "{}.{}".format(spec_type.split('.')[0], sub_props['Type'])
+            cf_value[prop_key] = self.validate_resource_value(
+                sub_type,
+                prop_value,
+                resource_name
+            ) #"Need {}".format(sub_type)
+
+        return cf_value
+
+    def process_resource_type(self, prop_name, resource_name, resource_type, value):
+        '''Decodes nested boto3 resource properties and maps them to CloudFormation properties'''
+        spec_type = "{}.{}".format(
+            resource_type['Type'],
+            resource_type['Properties'][prop_name]['Type']
+            )
+        if resource_type['Properties'][prop_name]['Type'] != 'List':
+            return self.validate_resource_value(spec_type, value, resource_name)
+
+        if 'ItemType' not in resource_type['Properties'][prop_name]:
+            return value
+
+        if resource_type['Properties'][prop_name]['ItemType'] == 'Tag':
+            return value
+
+        spec_type = "{}.{}".format(
+            resource_type['Type'],
+            resource_type['Properties'][prop_name]['ItemType']
+            )
+
+        list_values = []
+        for listitem in value:
+            list_values.append(
+                self.validate_resource_value(spec_type, listitem, resource_name)
+            )
+            return list_values
+
+        return value
+
+
+    def get_resource_values(self, resource, resource_type, resource_name):
+        '''Crawls a resource template and populates values from a boto3 resource'''
+        cf_values = {}
+        for key in resource_type['Properties'].keys():
+            value = self.get_dict_value(key, resource)
+            if value is None:
+                if resource_type['Properties'][key]['Required']:
+                    cf_values[key] = '!Ref {}{}'.format(resource_name.title(), key.title())
+                continue
+            if isinstance(value, str) and value.find('arn:aws') >= 0:
+                cf_values[key] = self.expand_arn(value)
+                continue
+            if 'Type' not in resource_type['Properties'][key]:
+                if isinstance(value, dict):
+                    newvalue = value
+                    for subkey, subvalue in value.items():
+                        if isinstance(subvalue, str) and subvalue.find('arn:aws') >= 0:
+                            newvalue[subkey] = self.expand_arn(subvalue)
+                    value = newvalue
+                cf_values[key] = value
+                continue
+
+            cf_values[key] = self.process_resource_type(key, resource_name, resource_type, value)
+
+        return cf_values
+
 
     def format_resource(self, resource, arn_str=''):
         '''Formats boto3 client resource into a CloudFormation resource'''
         arn_map = self.get_arn_map(arn_str) if arn_str != '' else self.arn_map
 
+        resource_name = self.get_resource_name(arn_map)
         resource_type = self.get_resource_type(arn_map)
         if resource_type is None:
             return None
 
-        resource_name = self.get_resource_name(arn_map)
+        resource_values = self.get_resource_values(resource, resource_type, resource_name)
         cf_resource = {
             resource_name: {
                 'Type': resource_type['Type'],
-                'Properties': {}
+                'Properties': resource_values
             }
         }
-
-        for key in resource_type['Properties'].keys():
-            value = self.get_dict_value(key, resource)
-            if value is None:
-                if resource_type['Properties'][key]['Required']:
-                    cf_resource[resource_name]['Properties'][key] = ''
-                continue
-            if isinstance(value, str) and value.find('arn:aws') >= 0:
-                cf_resource[resource_name]['Properties'][key] = self.expand_arn(value)
-                continue
-            cf_resource[resource_name]['Properties'][key] = value
 
         return {'name': resource_name, 'resource': cf_resource}
 
@@ -175,7 +259,7 @@ class ARNExport():
         if arn_map['service'] in service_args:
             args = service_args[arn_map['service']]
         else:
-            arg_name = '{}Name'.format(arn_map['resourcetype'].title())
+            arg_name = '{}Name'.format(arn_map['resourcetype'].title().replace('-', ''))
             arg_value = self.get_resource_name(arn_map, False)
             args = {arg_name: arg_value}
 
@@ -191,7 +275,10 @@ class ARNExport():
                 "I don't have a way of exporting this resource: {}{}".format(arn_str, self.arn_str)
             )
 
-        func = self.get_resource_function(aws, 'get_{}'.format(arn_map['resourcetype']))
+        func = self.get_resource_function(
+            aws,
+            'get_{}'.format(arn_map['resourcetype']).replace('-', '_')
+            )
         if func is None:
             func = getattr(aws, 'describe_{}s'.format(arn_map['resourcetype']))
             self.func_type = 1
@@ -203,7 +290,7 @@ class ARNExport():
         try:
             resource = func(**args)
         except botocore.exceptions.ParamValidationError:
-            sys.exit("I don't have a way of retrieving this resource for export.")
+            sys.exit("I don't have a way of retrieving this resource for export with {}.".format(args))
 
         resource.pop('ResponseMetadata', None)
 
